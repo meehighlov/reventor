@@ -1,19 +1,15 @@
 use teloxide::{prelude::*, utils::command::BotCommands};
-use teloxide::error_handlers::OnError;
-use teloxide::types::Update;
-use teloxide::adaptors::DefaultParseMode;
-use teloxide::payloads::SendMessage;
-use teloxide::errors::RequestError;
+use teloxide::RequestError;
 use dotenv::dotenv;
 use std::env;
 use regex::Regex;
-use chrono::NaiveDateTime;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-use std::io::{Error as IoError, ErrorKind};
-use std::fs;
+use chrono::{NaiveDateTime, Datelike};
+use rusqlite::{Connection, params, OptionalExtension};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
-struct DatabaseError(sqlx::Error);
+struct DatabaseError(rusqlite::Error);
 
 impl From<DatabaseError> for RequestError {
     fn from(err: DatabaseError) -> Self {
@@ -28,21 +24,92 @@ struct Event {
     date: Option<String>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct DbUser {
-    id: i64,
-    telegram_id: i64,
-    username: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
+#[derive(Debug)]
+struct UserEvent {
+    text: String,
+    event_time: String,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct DbEvent {
-    id: i64,
-    user_id: i64,
+#[derive(Debug)]
+struct NotificationEvent {
+    telegram_id: i64,
     text: String,
-    event_time: chrono::DateTime<chrono::Utc>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    event_time: String,
+}
+
+fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL UNIQUE,
+            username TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            event_time DATETIME NOT NULL,
+            notified BOOLEAN NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn ensure_user_exists(conn: &Connection, telegram_id: i64, username: Option<String>) -> Result<i64, rusqlite::Error> {
+    let existing_id: Option<i64> = conn.query_row(
+        "SELECT id FROM users WHERE telegram_id = ?",
+        params![telegram_id],
+        |row| row.get(0),
+    ).optional()?;
+
+    match existing_id {
+        Some(id) => Ok(id),
+        None => {
+            conn.execute(
+                "INSERT INTO users (telegram_id, username) VALUES (?, ?)",
+                params![telegram_id, username],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+fn save_event(conn: &Connection, user_id: i64, event: &Event) -> Result<(), rusqlite::Error> {
+    let event_time = match &event.date {
+        Some(date) => {
+            if date.matches('.').count() == 1 {
+                let current_year = chrono::Local::now().year();
+                format!("{}.{} {}", date, current_year, event.time)
+            } else {
+                format!("{} {}", date, event.time)
+            }
+        },
+        None => {
+            let today = chrono::Local::now().format("%d.%m.%Y").to_string();
+            format!("{} {}", today, event.time)
+        }
+    };
+
+    println!("Parsing datetime: {}", event_time);
+
+    let event_datetime = NaiveDateTime::parse_from_str(&event_time, "%d.%m.%Y %H:%M")
+        .unwrap_or_else(|_| panic!("Failed to parse date: {}", event_time));
+
+    conn.execute(
+        "INSERT INTO events (user_id, text, event_time) VALUES (?, ?, ?)",
+        params![user_id, event.text, event_datetime],
+    )?;
+
+    Ok(())
 }
 
 fn parse_event(text: &str) -> Option<Event> {
@@ -62,87 +129,73 @@ fn parse_event(text: &str) -> Option<Event> {
     }
 }
 
-async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL UNIQUE,
-            username TEXT,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )"
-    )
-    .execute(pool)
-    .await?;
+fn get_user_events(conn: &Connection, telegram_id: i64) -> Result<Vec<UserEvent>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT e.text, e.event_time 
+         FROM events e 
+         JOIN users u ON e.user_id = u.id 
+         WHERE u.telegram_id = ? 
+         ORDER BY e.event_time"
+    )?;
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            event_time DATETIME NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )"
-    )
-    .execute(pool)
-    .await?;
+    let events = stmt.query_map(params![telegram_id], |row| {
+        Ok(UserEvent {
+            text: row.get(0)?,
+            event_time: row.get(1)?,
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(())
+    Ok(events)
 }
 
-async fn ensure_user_exists(pool: &SqlitePool, telegram_id: i64, username: Option<String>) -> Result<i64, sqlx::Error> {
-    // Пробуем найти существующего пользователя
-    let user = sqlx::query_as::<_, DbUser>(
-        "SELECT * FROM users WHERE telegram_id = ?"
-    )
-    .bind(telegram_id)
-    .fetch_optional(pool)
-    .await?;
+fn get_due_events(conn: &Connection) -> Result<Vec<NotificationEvent>, rusqlite::Error> {
+    let now = chrono::Local::now().naive_local();
+    println!("Checking events at: {}", now);
 
-    match user {
-        Some(user) => Ok(user.id),
-        None => {
-            // Создаем нового пользователя
-            let result = sqlx::query(
-                "INSERT INTO users (telegram_id, username) VALUES (?, ?)"
-            )
-            .bind(telegram_id)
-            .bind(username)
-            .execute(pool)
-            .await?;
+    let mut stmt = conn.prepare(
+        "SELECT u.telegram_id, e.text, e.event_time 
+         FROM events e 
+         JOIN users u ON e.user_id = u.id 
+         WHERE strftime('%s', e.event_time) <= strftime('%s', ?) 
+         AND e.notified = 0"
+    )?;
 
-            Ok(result.last_insert_rowid())
-        }
+    let events = stmt.query_map(params![now], |row| {
+        let event_time: NaiveDateTime = row.get(2)?;
+        println!("Found event for time: {}", event_time);
+        
+        Ok(NotificationEvent {
+            telegram_id: row.get(0)?,
+            text: row.get(1)?,
+            event_time: event_time.format("%d.%m.%Y %H:%M").to_string(),
+        })
+    })?
+    .collect::<Result<Vec<_>, _>>()?;
+
+    println!("Total events found: {}", events.len());
+    for event in &events {
+        println!("Event details: {:?}", event);
     }
+
+    Ok(events)
 }
 
-async fn save_event(pool: &SqlitePool, user_id: i64, event: &Event) -> Result<(), sqlx::Error> {
-    let event_time = match &event.date {
-        Some(date) => {
-            format!("{} {}", date, event.time)
-        },
-        None => {
-            let today = chrono::Local::now().format("%d.%m.%Y").to_string();
-            format!("{} {}", today, event.time)
-        }
-    };
+fn mark_event_notified(conn: &Connection, telegram_id: i64, event_time: &str) -> Result<(), rusqlite::Error> {
+    println!("Marking event as notified: {} at {}", telegram_id, event_time);
+    
+    // Преобразуем строку времени обратно в NaiveDateTime для сравнения
+    let event_datetime = NaiveDateTime::parse_from_str(event_time, "%d.%m.%Y %H:%M")
+        .unwrap_or_else(|_| panic!("Failed to parse date: {}", event_time));
 
-    let event_time = chrono::NaiveDateTime::parse_from_str(
-        &format!("{} {}", event_time, "+00:00"),
-        "%d.%m.%Y %H:%M %z"
-    )
-    .unwrap()
-    .and_utc();
+    let rows_affected = conn.execute(
+        "UPDATE events SET notified = 1 
+         WHERE user_id IN (SELECT id FROM users WHERE telegram_id = ?) 
+         AND strftime('%s', event_time) = strftime('%s', ?)",
+        params![telegram_id, event_datetime],
+    )?;
 
-    sqlx::query(
-        "INSERT INTO events (user_id, text, event_time) VALUES (?, ?, ?)"
-    )
-    .bind(user_id)
-    .bind(&event.text)
-    .bind(event_time)
-    .execute(pool)
-    .await?;
-
+    println!("Updated {} rows", rows_affected);
     Ok(())
 }
 
@@ -155,31 +208,68 @@ async fn main() {
     let token = env::var("TELOXIDE_TOKEN").expect("TELOXIDE_TOKEN не найден в .env файле");
     let bot = Bot::new(token);
 
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./data/data.db".to_string());
-    
-    // Добавляем эти строки перед подключением к БД
-    std::fs::create_dir_all("./data").expect("Failed to create data directory");
-    
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await
-        .expect("Could not connect to database");
+    let conn = Connection::open("reventor.db").expect("Failed to open database");
+    init_db(&conn).expect("Failed to initialize database");
+    let db = Arc::new(Mutex::new(conn));
 
-    init_db(&pool).await.expect("Failed to initialize database");
+    let bot_for_notifications = bot.clone();
+    let db_for_notifications = db.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let conn = db_for_notifications.lock().await;
+            println!("Checking for due events...");
+            
+            if let Ok(events) = get_due_events(&conn) {
+                println!("Found {} due events", events.len());
+                for event in events {
+                    println!("Sending notification for event: {:?}", event);
+                    let _ = bot_for_notifications
+                        .send_message(
+                            ChatId(event.telegram_id),
+                            format!("🔔 Напоминание!\n{}\nВремя: {}", event.text, event.event_time)
+                        )
+                        .await;
+                    
+                    let _ = mark_event_notified(&conn, event.telegram_id, &event.event_time);
+                }
+            }
+            drop(conn);
+            
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let pool = pool.clone();
+        let db = db.clone();
         async move {
             if let Some(text) = msg.text() {
-                if let Some(event) = parse_event(text) {
+                if text == "/events" {
+                    let conn = db.lock().await;
+                    let events = get_user_events(&conn, msg.from().unwrap().id.0 as i64)
+                        .map_err(|e| DatabaseError(e))?;
+
+                    if events.is_empty() {
+                        bot.send_message(msg.chat.id, "У вас пока нет запланированных событий").await?;
+                    } else {
+                        let events_text = events
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| format!("{}. {} - {}", i + 1, e.event_time, e.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        
+                        bot.send_message(msg.chat.id, format!("Ваши события:\n{}", events_text)).await?;
+                    }
+                } else if let Some(event) = parse_event(text) {
+                    let conn = db.lock().await;
                     let user_id = ensure_user_exists(
-                        &pool,
+                        &conn,
                         msg.from().unwrap().id.0 as i64,
                         msg.from().unwrap().username.clone()
-                    ).await.map_err(|e| DatabaseError(e))?;
+                    ).map_err(|e| DatabaseError(e))?;
 
-                    save_event(&pool, user_id, &event).await
+                    save_event(&conn, user_id, &event)
                         .map_err(|e| DatabaseError(e))?;
 
                     let response = match event.date {
