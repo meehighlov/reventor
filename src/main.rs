@@ -3,7 +3,7 @@ use teloxide::RequestError;
 use dotenv::dotenv;
 use std::env;
 use regex::Regex;
-use chrono::{NaiveDateTime, Datelike};
+use chrono::{NaiveDateTime, Datelike, Timelike};
 use rusqlite::{Connection, params, OptionalExtension};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -54,7 +54,6 @@ fn init_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             user_id INTEGER NOT NULL,
             text TEXT NOT NULL,
             event_time DATETIME NOT NULL,
-            notified BOOLEAN NOT NULL DEFAULT 0,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )",
@@ -101,8 +100,11 @@ fn save_event(conn: &Connection, user_id: i64, event: &Event) -> Result<(), rusq
 
     println!("Parsing datetime: {}", event_time);
 
-    let event_datetime = NaiveDateTime::parse_from_str(&event_time, "%d.%m.%Y %H:%M")
-        .unwrap_or_else(|_| panic!("Failed to parse date: {}", event_time));
+    // Преобразуем в нужный формат без секунд
+    let event_datetime = NaiveDateTime::parse_from_str(&format!("{}:00", event_time), "%d.%m.%Y %H:%M:%S")
+        .unwrap_or_else(|_| panic!("Failed to parse date: {}", event_time))
+        .format("%d.%m.%Y %H:%M")
+        .to_string();
 
     conn.execute(
         "INSERT INTO events (user_id, text, event_time) VALUES (?, ?, ?)",
@@ -150,30 +152,30 @@ fn get_user_events(conn: &Connection, telegram_id: i64) -> Result<Vec<UserEvent>
 }
 
 fn get_due_events(conn: &Connection) -> Result<Vec<NotificationEvent>, rusqlite::Error> {
-    let now = chrono::Local::now().naive_local();
+    let now = chrono::Local::now().format("%d.%m.%Y %H:%M").to_string();
     println!("Checking events at: {}", now);
 
     let mut stmt = conn.prepare(
         "SELECT u.telegram_id, e.text, e.event_time 
          FROM events e 
          JOIN users u ON e.user_id = u.id 
-         WHERE strftime('%s', e.event_time) <= strftime('%s', ?) 
-         AND e.notified = 0"
+         WHERE e.event_time = ?"
     )?;
 
     let events = stmt.query_map(params![now], |row| {
-        let event_time: NaiveDateTime = row.get(2)?;
-        println!("Found event for time: {}", event_time);
+        let event_time: String = row.get(2)?;
+        let telegram_id: i64 = row.get(0)?;
+        println!("Found matching event: time={}, telegram_id={}", event_time, telegram_id);
         
         Ok(NotificationEvent {
-            telegram_id: row.get(0)?,
+            telegram_id,
             text: row.get(1)?,
-            event_time: event_time.format("%d.%m.%Y %H:%M").to_string(),
+            event_time,
         })
     })?
     .collect::<Result<Vec<_>, _>>()?;
 
-    println!("Total events found: {}", events.len());
+    println!("Total events found for time {}: {}", now, events.len());
     for event in &events {
         println!("Event details: {:?}", event);
     }
@@ -181,21 +183,13 @@ fn get_due_events(conn: &Connection) -> Result<Vec<NotificationEvent>, rusqlite:
     Ok(events)
 }
 
-fn mark_event_notified(conn: &Connection, telegram_id: i64, event_time: &str) -> Result<(), rusqlite::Error> {
-    println!("Marking event as notified: {} at {}", telegram_id, event_time);
-    
-    // Преобразуем строку времени обратно в NaiveDateTime для сравнения
-    let event_datetime = NaiveDateTime::parse_from_str(event_time, "%d.%m.%Y %H:%M")
-        .unwrap_or_else(|_| panic!("Failed to parse date: {}", event_time));
-
-    let rows_affected = conn.execute(
-        "UPDATE events SET notified = 1 
+fn mark_event_sent(conn: &Connection, telegram_id: i64, event_time: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE events SET event_time = 'done' 
          WHERE user_id IN (SELECT id FROM users WHERE telegram_id = ?) 
-         AND strftime('%s', event_time) = strftime('%s', ?)",
-        params![telegram_id, event_datetime],
+         AND event_time = ?",
+        params![telegram_id, event_time],
     )?;
-
-    println!("Updated {} rows", rows_affected);
     Ok(())
 }
 
@@ -231,12 +225,13 @@ async fn main() {
                         )
                         .await;
                     
-                    let _ = mark_event_notified(&conn, event.telegram_id, &event.event_time);
+                    // Очищаем event_time после отправки уведомления
+                    let _ = mark_event_sent(&conn, event.telegram_id, &event.event_time);
                 }
             }
             drop(conn);
             
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     });
 
